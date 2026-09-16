@@ -2,11 +2,13 @@
 #define JOGO_H
 
 #include "protocolo.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 // Estruturas
 typedef struct {
     char nome[NOME_SIZE];
-    int fd;
+    int fd;//socket (meia kkkk)
     int pontos;
     char palavra_atual[BUFFER_SIZE];
 } jogador;
@@ -29,3 +31,5 @@ int enviar_msg(int fd, const char *tipo, const char *conteudo);
 int receber_msg(int fd, char *tipo, char *conteudo, size_t tam);
 
 int receber_com_timeout(int fd, char *buffer, size_t tam, int segundos);
+
+#endif
