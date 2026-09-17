@@ -171,7 +171,7 @@ void *esperar_jogador(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
-    int porta = 8080; // porta padrao de teste
+    int porta = 7070; // porta padrao de teste
     if (argc > 1) {
         porta = atoi(argv[1]);
     }
