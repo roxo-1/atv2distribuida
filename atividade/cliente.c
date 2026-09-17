@@ -12,7 +12,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h> 
 
-#define PORTA         9090
+#define PORTA         7070
 #define SERVIDOR_IP   "127.0.0.1"
 
 #define MAX_CAMPOS 8
