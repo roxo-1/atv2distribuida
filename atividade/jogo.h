@@ -14,7 +14,7 @@ typedef struct {
 } jogador;
 
 typedef struct {
-    int max_joga = MAX_JOGADORES;
+    int max_joga;
     int rodada;
     char letra_atual;
 } partida;

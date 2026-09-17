@@ -2,337 +2,229 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/select.h>
+#include <time.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <errno.h>
 #include "protocolo.h"
 #include "jogo.h"
 #include "jogo.c"
 
-//foi reutilizado parte do código fornecido pelo professor :/ 
-
-#define PORTA 9090
+int servidor_rodando = 1;
+int socket_servidor = -1;
+int socket_esperando = -1;
+char nome_do_esperando[NOME_SIZE];
+pthread_mutex_t lock_fila = PTHREAD_MUTEX_INITIALIZER;
+int id_partida_global = 1;
 
 typedef struct {
-    int   fd;                /* file descriptor do socket */
-    char  nome[NOME_SIZE];   /* nome do usuário */
-    char  ip[INET_ADDRSTRLEN]; /* endereço IP */
-    int   porta;             /* porta do cliente */
-} Cliente;
+    jogador j1;
+    jogador j2;
+    int id;
+} PartidaInfo;
 
-/* Lista global de clientes conectados */
-static Cliente clientes[MAX_JOGADORES];
-static int num_clientes = 0;
+typedef struct {
+    int socket_cliente;
+} ConexaoInfo;
 
-void configurar_sinais(void){}
-void tratar_sigint(int sig){}
-int inicializar_servidor(int porta){}
-void* tratar_partida(void *arg){}
-int executar_rodada(int rodada_num, partida *partida){}
+void manda(jogador *j, const char *tipo, const char *msg) {
+    enviar_msg(j->fd, tipo, msg);
+}
 
+int pegar_nome(int sock, char *nome_buffer) {
+    char tipo[BUFFER_SIZE];
+    char conteudo[BUFFER_SIZE];
 
-char sortear_letra(void) {
+    enviar_msg(sock, PROTO_NOME, "");
+
+    int lido = receber_msg(sock, tipo, conteudo, BUFFER_SIZE);
+    if (lido <= 0) {
+        return -1; // deu merda na conexão
+    }
+
+    if (strlen(conteudo) == 0) {
+        strcpy(nome_buffer, "JogadorAnonimo");
+    } else {
+        strcpy(nome_buffer, conteudo);
+    }
+    return 0;
+}
+
+void *rodar_partida(void *arg) {
+    PartidaInfo *dados = (PartidaInfo *)arg;
+    jogador player1 = dados->j1;
+    jogador player2 = dados->j2;
+    int id = dados->id;
+    free(dados);
+    printf("[PARTIDA %d INICIADA] %s contra %s\n", id, player1.nome, player2.nome);
+    char boas_vindas[BUFFER_SIZE];
+    sprintf(boas_vindas, "Partida iniciada! %s vs %s. Boa sorte!", player1.nome, player2.nome);
+    manda(&player1, PROTO_MSG, boas_vindas);
+    manda(&player2, PROTO_MSG, boas_vindas);
+
+    for (int r = 1; r <= TOTAL_RODADAS; r++) {
+        char letra = sortear_letra();
+        
+        char msg_rodada[BUFFER_SIZE];
+        sprintf(msg_rodada, "%d|%c|%d", r, letra, TEMPO_LIMITE);
+        manda(&player1, PROTO_RODADA, msg_rodada);
+        manda(&player2, PROTO_RODADA, msg_rodada);
+
+        printf("Rodada %d rodando! Letra da vez: %c\n", r, letra);
+
+        char palavra1[BUFFER_SIZE] = "";
+        char palavra2[BUFFER_SIZE] = "";
+        
+        char tipo[BUFFER_SIZE];
+        
+        receber_msg(player1.fd, tipo, palavra1, BUFFER_SIZE);
+        receber_msg(player2.fd, tipo, palavra2, BUFFER_SIZE);
+
+        int ok1 = validar_palavra(palavra1, letra);
+        int ok2 = validar_palavra(palavra2, letra);
+
+        if (ok1 && ok2 && strcasecmp(palavra1, palavra2) == 0) {
+            ok1 = 0;
+            ok2 = 0;
+        }
+
+        if (ok1) player1.pontos++;
+        if (ok2) player2.pontos++;
+
+        char resp1[BUFFER_SIZE], resp2[BUFFER_SIZE];
+        sprintf(resp1, "Resultado: vc mandou %s (%s). Oponente: %s", palavra1, ok1 ? "valida" : "invalida", palavra2);
+        sprintf(resp2, "Resultado: vc mandou %s (%s). Oponente: %s", palavra2, ok2 ? "valida" : "invalida", palavra1);
+
+        manda(&player1, PROTO_RESULTADO, resp1);
+        manda(&player2, PROTO_RESULTADO, resp2);
+
+        char placar1[BUFFER_SIZE], placar2[BUFFER_SIZE];
+        sprintf(placar1, "%s|%d|%s|%d", player1.nome, player1.pontos, player2.nome, player2.pontos);
+        sprintf(placar2, "%s|%d|%s|%d", player2.nome, player2.pontos, player1.nome, player1.pontos);
+        manda(&player1, PROTO_PLACAR, placar1);
+        manda(&player2, PROTO_PLACAR, placar2);
+    }
+
+    char final[BUFFER_SIZE];
+    if (player1.pontos > player2.pontos) {
+        sprintf(final, "Vitoria de %s! Placar: %d x %d", player1.nome, player1.pontos, player2.pontos);
+    } else if (player2.pontos > player1.pontos) {
+        sprintf(final, "Vitoria de %s! Placar: %d x %d", player2.nome, player2.pontos, player1.pontos);
+    } else {
+        sprintf(final, "Empate! Placar: %d x %d", player1.pontos, player2.pontos);
+    }
+
+    manda(&player1, PROTO_FIM, final);
+    manda(&player2, PROTO_FIM, final);
+
+    close(player1.fd);
+    close(player2.fd);
+
+    printf("[PARTIDA %d FINALIZADA]\n", id);
+    return NULL;
+}
+
+void *esperar_jogador(void *arg) {
+    ConexaoInfo *info = (ConexaoInfo *)arg;
+    int sock = info->socket_cliente;
+    free(info);
+
+    char nome[NOME_SIZE];
+    if (pegar_nome(sock, nome) != 0) {
+        printf("Erro ao pegar nome do socket %d, fechando...\n", sock);
+        close(sock);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&lock_fila);
+
+    if (socket_esperando == -1) {
+        socket_esperando = sock;
+        strcpy(nome_do_esperando, nome);
+        pthread_mutex_unlock(&lock_fila);
+
+        printf("%s ta esperando outro jogador entrar...\n", nome);
+        enviar_msg(sock, PROTO_AGUARDE, "Aguarde outro jogador conectar...");
+    } else {
+        PartidaInfo *partida = malloc(sizeof(PartidaInfo));
+
+        partida->j1.fd = socket_esperando;
+        strcpy(partida->j1.nome, nome_do_esperando);
+        partida->j1.pontos = 0;
+
+        partida->j2.fd = sock;
+        strcpy(partida->j2.nome, nome);
+        partida->j2.pontos = 0;
+
+        partida->id = id_partida_global++;
+
+        socket_esperando = -1;
+        pthread_mutex_unlock(&lock_fila);
+
+        pthread_t t_partida;
+        pthread_create(&t_partida, NULL, rodar_partida, partida);
+        pthread_detach(t_partida);
+    }
+
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    int porta = 8080; // porta padrao de teste
+    if (argc > 1) {
+        porta = atoi(argv[1]);
+    }
 
     srand(time(NULL));
-    
-    char letra = 'A' + (rand() % 26);
-    
-    printf("Letra aleatoria: %c\n", letra);
-}
 
-
-int validar_palavra(const char *palavra, char letra) {
-    
-    if (lenght(*palavra) < 4) {
-        printf("Palavra menor que 5 letras");
-        return 0;
-    } 
-    
-    toupper(*palavra);
-    char primeira_letra = *palavra;
-    
-    if (primeira_letra != letra) {
-        printf("Palavra não começa com a letra escolhida");
-        return 0;
-    } 
-    if (isalpha(*palavra)) {
-        printf("Palavra contém apenas letras");
+    // 1. Cria socket
+    socket_servidor = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_servidor < 0) {
+        printf("Erro no socket!\n");
         return 1;
     }
-    printf("Palavra não contém apenas letras");
-    return 0;
 
-}
-
-
-int enviar_msg(int fd, const char *tipo, const char *conteudo) {
-    char buffer[BUFFER_SIZE];
-    
-    snprintf(buffer, sizeof(buffer), "%s|%s\n", tipo, conteudo);
-    
-    int resultado = send(fd, buffer, strlen(buffer), 0);
-    
-    if (resultado == -1) {
-        perror("Erro ao enviar mensagem");
-    }
-   
-    return resultado;
-}
-
-int receber_com_timeout(int fd, char *buffer, size_t tam, int segundos){
-    fd_set conjunto;
-    struct timeval timeout;
-    int resultado_select;
-
-    FD_ZERO(&conjunto);
-    FD_SET(fd, &conjunto);
-
-    timeout.tv_sec = segundos;
-    timeout.tv_usec = 0;
-
-    while (resultado_select == -1) {
-        resultado_select = select(fd + 1, &conjunto, NULL, NULL, &timeout);
-    }
-
-    if (resultado_select == -1) {
-        printf("Erro no select");
-        return -1; 
-    }
-
-    if (resultado_select == 0) {
-        return -2; 
-    }
-
-    if (FD_ISSET(fd, &conjunto)) {
-        size_t bytes_recebidos = recv(fd, buffer, tam, 0);
-        
-        if (bytes_recebidos == -1) {
-            printf("Erro no recv");
-            return -1;
-        }
-        
-        return (int)bytes_recebidos; 
-    }
-
-    return -1;
-}
-
-int main(int argc, char *argv[]){
-    int server_fd;
-    struct sockaddr_in servidor_addr;
     int opt = 1;
+    setsockopt(socket_servidor, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    /* -------------------------------------------------------
-     Criar o socket do servidor
-     * ------------------------------------------------------- */
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        perror("Erro ao criar socket");
-        exit(EXIT_FAILURE);
+    // 2. Configura endereco
+    struct sockaddr_in servidor;
+    servidor.sin_family = AF_INET;
+    servidor.sin_addr.s_addr = INADDR_ANY;
+    servidor.sin_port = htons(porta);
+
+    // 3. Bind
+    if (bind(socket_servidor, (struct sockaddr *)&servidor, sizeof(servidor)) < 0) {
+        printf("Erro no bind! Tente outra porta.\n");
+        return 1;
     }
 
-    /* Permite reutilizar a porta imediatamente */
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // 4. Listen
+    listen(socket_servidor, 5);
 
-    /* -------------------------------------------------------
-     * PASSO 2: Bind + Listen
-     * ------------------------------------------------------- */
-    memset(&servidor_addr, 0, sizeof(servidor_addr));
-    servidor_addr.sin_family = AF_INET;
-    servidor_addr.sin_addr.s_addr = INADDR_ANY;
-    servidor_addr.sin_port = htons(PORTA);
+    printf("Servidor rodando na porta %d! Esperando conexoes...\n", porta);
 
-    if (bind(server_fd, (struct sockaddr *)&servidor_addr, sizeof(servidor_addr)) == -1) {
-        printf("Erro no bind");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
+    while (servidor_rodando) {
+        struct sockaddr_in cliente;
+        socklen_t tamanho = sizeof(cliente);
 
-    if (listen(server_fd, 10) == -1) {
-        printf("Erro no listen");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    printf("========================================\n");
-    printf("   SERVIDOR DE JOGO - Porta %d\n", PORTA);
-    printf("   Aguardando conexões...\n");
-    printf("   Max clientes: %d\n", MAX_JOGADORES);
-    printf("========================================\n\n");
-
-    /* -------------------------------------------------------
-     * Loop principal com select()
-     *
-     * A cada iteração:
-     *   1. Montamos o fd_set com server_fd + todos os clientes
-     *   2. Chamamos select() — bloqueia até alguma atividade
-     *   3. Verificamos QUEM tem atividade e tratamos
-     * ------------------------------------------------------- */
-    while (1) {
-        fd_set read_fds;  /* conjunto de fds para monitorar */
-        int    max_fd;    /* maior fd (necessário para select) */
-
-        /*
-         * Reconstruir o fd_set a cada iteração.
-         * select() MODIFICA o fd_set — só os fds prontos ficam marcados.
-         * Por isso, precisamos montar novamente.
-         */
-        FD_ZERO(&read_fds);
-        FD_SET(server_fd, &read_fds);
-        max_fd = server_fd;
-
-        /* Adiciona todos os clientes conectados ao conjunto */
-        for (int i = 0; i < num_clientes; i++) {
-            FD_SET(clientes[i].fd, &read_fds);
-            if (clientes[i].fd > max_fd) {
-                max_fd = clientes[i].fd;
-            }
+        int cliente_sock = accept(socket_servidor, (struct sockaddr *)&cliente, &tamanho);
+        if (cliente_sock < 0) {
+            printf("Erro no accept!\n");
+            continue;
         }
 
-        /*
-         * select() bloqueia aqui até que:
-         *   - Um novo cliente tente conectar (server_fd pronto)
-         *   - Um cliente conectado envie dados (cliente_fd pronto)
-         *   - Um cliente desconecte (cliente_fd pronto com 0 bytes)
-         */
-        int atividade = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-        if (atividade == -1) {
-            /* EINTR acontece se um sinal interromper o select — normalmente
-               podemos simplesmente continuar o loop */
-            if (errno == EINTR) continue;
-            perror("Erro no select");
-            break;
-        }
+        printf("Nova conexao aceita no socket %d\n", cliente_sock);
 
-        /* -------------------------------------------------------
-         * CASO 1: Atividade no server_fd → nova conexão!
-         * ------------------------------------------------------- */
-        if (FD_ISSET(server_fd, &read_fds)) {
-            struct sockaddr_in cliente_addr;
-            socklen_t cliente_len = sizeof(cliente_addr);
+        ConexaoInfo *info = malloc(sizeof(ConexaoInfo));
+        info->socket_cliente = cliente_sock;
 
-            int novo_fd = accept(server_fd, (struct sockaddr *)&cliente_addr, &cliente_len);
-            if (novo_fd == -1) {
-                perror("Erro no accept");
-                continue;   /* não encerra o servidor por causa de um erro */
-            }
-
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &cliente_addr.sin_addr, ip_str, sizeof(ip_str));
-            int porta_cliente = ntohs(cliente_addr.sin_port);
-
-            printf("[+] Nova conexão: %s:%d (fd=%d)\n", ip_str, porta_cliente, novo_fd);
-
-            /*
-             * O primeiro dado que o cliente envia é o nome do usuário.
-             * Esperamos recebê-lo logo após a conexão.
-             */
-            char nome[NOME_SIZE] = {0};
-            ssize_t n = recv(novo_fd, nome, NOME_SIZE - 1, 0);
-            if (n <= 0) {
-                printf("[-] Cliente desconectou antes de informar nome\n");
-                close(novo_fd);
-                continue;
-            }
-            nome[n] = '\0';
-
-            /* Remove possível \n do nome */
-            char *newline = strchr(nome, '\n');
-            if (newline) *newline = '\0';
-
-            /* Tenta adicionar à lista */
-            if (adicionar_cliente(novo_fd, nome, ip_str, porta_cliente) == -1) {
-                const char *msg_cheio = "Servidor cheio. Tente mais tarde.\n";
-                send(novo_fd, msg_cheio, strlen(msg_cheio), 0);
-                close(novo_fd);
-                printf("[!] Servidor cheio, conexão recusada\n");
-                continue;
-            }
-
-            printf("[+] \"%s\" entrou no chat (%d clientes online)\n",
-                   nome, num_clientes);
-
-            /* Notifica todos os outros */
-            char aviso[BUFFER_SIZE];
-            snprintf(aviso, sizeof(aviso),
-                     ">>> %.*s entrou no chat (%d online) <<<\n",
-                     NOME_SIZE - 1, nome, num_clientes);
-            broadcast(aviso, novo_fd);
-
-            /* Mensagem de boas-vindas para o novo cliente */
-            char bemvindo[BUFFER_SIZE];
-            snprintf(bemvindo, sizeof(bemvindo),
-                     ">>> Bem-vindo ao chat, %.*s! (%d online) <<<\n",
-                     NOME_SIZE - 1, nome, num_clientes);
-            send(novo_fd, bemvindo, strlen(bemvindo), 0);
-        }
-
-        /* -------------------------------------------------------
-         * CASO 2: Atividade em algum cliente → mensagem ou desconexão
-         *
-         * Percorremos a lista de trás para frente (i--) para
-         * evitar problemas ao remover clientes durante a iteração.
-         * ------------------------------------------------------- */
-        for (int i = num_clientes - 1; i >= 0; i--) {
-            int cli_fd = clientes[i].fd;
-
-            if (!FD_ISSET(cli_fd, &read_fds)) {
-                continue;   /* este cliente não tem atividade */
-            }
-
-            char buffer[BUFFER_SIZE] = {0};
-            ssize_t bytes = recv(cli_fd, buffer, BUFFER_SIZE - 1, 0);
-
-            if (bytes <= 0) {
-                /* ----- Cliente desconectou ----- */
-                char nome_saiu[NOME_SIZE];
-                remover_cliente(cli_fd, nome_saiu, sizeof(nome_saiu));
-                close(cli_fd);
-
-                printf("[-] \"%s\" saiu do chat (%d online)\n",
-                       nome_saiu, num_clientes);
-
-                char aviso[BUFFER_SIZE];
-                snprintf(aviso, sizeof(aviso),
-                         ">>> %.*s saiu do chat (%d online) <<<\n",
-                         NOME_SIZE - 1, nome_saiu, num_clientes);
-                broadcast(aviso, -1);  /* -1 = envia para todos */
-
-            } else {
-                /* ----- Mensagem recebida ----- */
-                buffer[bytes] = '\0';
-
-                /* Remove \n final se existir */
-                char *newline = strchr(buffer, '\n');
-                if (newline) *newline = '\0';
-
-                /* Verifica se a mensagem não está vazia após trim */
-                if (strlen(buffer) == 0) continue;
-
-                const char *nome_remetente = nome_por_fd(cli_fd);
-                printf("[%s]: %s\n", nome_remetente, buffer);
-
-                /* Formata "[Nome]: mensagem" e envia para todos os outros */
-                char msg_formatada[BUFFER_SIZE];
-                snprintf(msg_formatada, sizeof(msg_formatada),
-                         "[%.*s]: %.*s\n",
-                         NOME_SIZE - 1, nome_remetente,
-                         BUFFER_SIZE - NOME_SIZE - 5, buffer);
-                broadcast(msg_formatada, cli_fd);
-            }
-        }
+        pthread_t t_cliente;
+        pthread_create(&t_cliente, NULL, esperar_jogador, info);
+        pthread_detach(t_cliente);
     }
 
-    /* -------------------------------------------------------
-     * Limpeza final (só chega aqui se o loop for interrompido)
-     * ------------------------------------------------------- */
-    for (int i = 0; i < num_clientes; i++) {
-        close(clientes[i].fd);
-    }
-    close(server_fd);
-    printf("\n[SERVIDOR] Encerrado.\n");
-
+    close(socket_servidor);
     return 0;
 }

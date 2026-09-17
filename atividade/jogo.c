@@ -19,7 +19,7 @@ int validar_palavra(const char *palavra, char letra) {
     if (palavra == NULL) return 0;
 
     size_t tam = strlen(palavra);
-    if (tam < 4) {
+    if (tam < MIN_CARACTERES) {
         printf("Palavra com menos de 4 letras\n");
         return 0;
     }
